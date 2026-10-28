@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" width="128" height="128" alt="ShotDrop logo">
+</p>
+
 # ShotDrop
 
 > [!WARNING]

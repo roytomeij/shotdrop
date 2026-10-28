@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">ShotDrop</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1E293B"/>
+      <stop offset="1" stop-color="#0B1220"/>
+    </linearGradient>
+    <linearGradient id="drop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#67E8F9"/>
+      <stop offset="1" stop-color="#0EA5E9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Tile -->
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+
+  <!-- Screenshot selection corners -->
+  <g fill="none" stroke="#F8FAFC" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M44 84 V44 H84"/>
+    <path d="M172 44 H212 V84"/>
+    <path d="M212 172 V212 H172"/>
+    <path d="M84 212 H44 V172"/>
+  </g>
+
+  <!-- Drop -->
+  <path d="M128 62 C128 62 82 116 82 150 A46 46 0 0 0 174 150 C174 116 128 62 128 62 Z" fill="url(#drop)"/>
+
+  <!-- Terminal prompt inside the drop -->
+  <g fill="none" stroke="#0B1220" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M106 138 L120 151 L106 164"/>
+    <path d="M128 166 H148"/>
+  </g>
+</svg>
