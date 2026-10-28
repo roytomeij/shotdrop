@@ -68,6 +68,15 @@ turns a pasted image path into an `[Image #1]` attachment.
    shotdrop(session_id: id)
    ```
 
+   If iTerm2 asks which sessions to apply the action to, choose the **current
+   session**. ShotDrop works on the tab you invoke it from: it finds that tab's
+   ssh connection and pastes the path back into it. Applied to all sessions, it
+   would start in every tab at once, and since only one capture runs at a
+   time, the screenshot would land in an arbitrary tab.
+
+   Bind it here (Settings → Keys) rather than under Profiles → Keys so the
+   hotkey works in every profile.
+
 5. **Screen Recording permission:** the first capture triggers a macOS prompt.
    Grant it to iTerm2 under System Settings → Privacy & Security → Screen &
    System Audio Recording, then restart iTerm2.
