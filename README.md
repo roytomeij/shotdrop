@@ -1,9 +1,25 @@
 # ShotDrop
 
+> [!WARNING]
+> **This code was written entirely by Claude Code (an AI), without human
+> intervention or human code review.** A human has tested it and found it to
+> work, but only with macOS on both ends. Linux remotes should work but haven't
+> been tested by a human. Nobody has reviewed the code line by line. **Use it at
+> your own risk.** It runs
+> with your permissions, reads your process list, uses your SSH credentials and
+> types into your terminal. Read `shotdrop.py` before you install it.
+
 Screenshot-to-remote for iTerm2. Press a hotkey in a tab that's SSH'd into a
-remote Mac, select a screen area, and the screenshot is uploaded to that host.
+remote host, select a screen area, and the screenshot is uploaded to that host.
 The remote path is then pasted into the terminal and copied to your local
 clipboard.
+
+**Where it runs:**
+- **Locally:** macOS with iTerm2 only.
+- **Remote:** any Unix-like host reached with OpenSSH, such as macOS or Linux
+  (Claude Code on Linux works the same way). On the remote, ShotDrop only uses
+  `/bin/sh` and standard tools (`mkdir`, `cat`, `wc`, `mv`, `find`). Windows
+  remotes aren't supported.
 
 It exists for Claude Code: its Ctrl+V image paste reads the clipboard of the
 machine it runs on, so it can't see your local Mac's clipboard over SSH.
@@ -18,15 +34,24 @@ turns a pasted image path into an `[Image #1]` attachment.
      (`tmux display-message -c <tty> -p '#{pane_pid}'`) and looks for `ssh`
      in that pane's process tree.
 
+   Only an `ssh` in the foreground counts, so a backgrounded tunnel
+   (`ssh -N -L … &`) in the same shell is never picked.
+
    It reads the exact `ssh` command line, keeps the options that affect the
    connection (`-p -i -F -J -l -o -S -4 -6 -C` …), and drops the rest
    (`-t -L -R -D -N -f -v` …) as well as any remote command.
 2. Runs `screencapture -i`. Esc cancels silently.
-3. Uploads with `ssh` itself (so the options are reused verbatim):
-   `ssh -o BatchMode=yes … <dest> 'cat > /tmp/shotdrop/<timestamp>.png'`.
-   On the same connection it deletes screenshots older than 7 days.
-4. Pastes the remote path into the session using bracketed-paste markers (no
-   newline, so you can type your prompt after it) and copies it with `pbcopy`.
+3. Uploads with `ssh` itself, so the options are reused verbatim:
+   `ssh -o BatchMode=yes … <dest> '/bin/sh -c …'`. The remote script checks
+   that `/tmp/shotdrop` is a real directory owned by you, so another user on
+   the remote can't intercept the file. It writes to a temporary name and only
+   moves the file into place once every byte has arrived. On the same
+   connection it deletes screenshots older than 7 days.
+4. Pastes the remote path, with no newline so you can type your prompt after
+   it, and copies it with `pbcopy`. In a plain tab it sends the path wrapped
+   in bracketed-paste markers. With local tmux it pastes through tmux
+   (`paste-buffer -p`) into the pane where you pressed the hotkey, even if
+   you've switched panes since.
 
 ## Setup
 
@@ -57,9 +82,9 @@ turns a pasted image path into an `[Image #1]` attachment.
    ```
 
    This copies `shotdrop.py` to
-   `~/Library/Application Support/iTerm2/Scripts/AutoLaunch/`. Restart iTerm2,
-   or start it now from Scripts → AutoLaunch → shotdrop.py. Re-run
-   `install.sh` (and restart the script) after editing `shotdrop.py`.
+   `~/Library/Application Support/iTerm2/Scripts/AutoLaunch/`. Quit and
+   reopen iTerm2 to load it. To update, `git pull` (or edit `shotdrop.py`),
+   then run `./install.sh` and restart iTerm2 again.
 
 4. **Bind a key:** Settings → Keys → Key Bindings → **+** → pick a shortcut →
    Action "Invoke Script Function" → enter:
@@ -92,7 +117,7 @@ At the top of `shotdrop.py`:
 
 | Setting          | Default           | Meaning |
 |------------------|-------------------|---------|
-| `REMOTE_DIR`     | `"/tmp/shotdrop"` | Absolute directory on the remote. Created with mode 700. |
+| `REMOTE_DIR`     | `"/tmp/shotdrop"` | Absolute directory on the remote. Must be owned by you; it's created if missing and set to mode 700. |
 | `RETENTION_DAYS` | `7`               | Older `.png` files in `REMOTE_DIR` are deleted on each upload. |
 | `INSERT_MODE`    | `"bracketed"`     | `"bracketed"`: paste the path (gives `[Image #N]` in Claude Code). `"typed"`: type the plain path (Claude still reads the file, without the attachment pill). `"none"`: clipboard only. |
 | `UPLOAD_TIMEOUT` | `30`              | Seconds before the upload is aborted. |
@@ -114,8 +139,15 @@ Script output and Python errors also show in Scripts → Manage → Console.
 - **"No SSH connection found in this tab".** The tab's foreground job (or the
   active pane of a local tmux client) has no `ssh` process. `mosh`, `et` and
   tmux `-CC` integration mode aren't supported.
-- **"Couldn't query local tmux".** The tmux client in the tab couldn't be
-  queried. Check the log for tmux's error message.
+- **"Couldn't query local tmux" / "Couldn't paste into tmux".** The tmux
+  client in the tab couldn't be reached. Check the log for tmux's error
+  message. After a paste error, the path is still on your clipboard.
+- **"Couldn't read the ssh command line".** macOS didn't return the exact
+  arguments of the tab's ssh process. ShotDrop refuses to guess, so the
+  screenshot can't end up on the wrong host.
+- **"Upload failed: /tmp/shotdrop is not a directory owned by you".** Someone
+  else (or a symlink) owns that path on the remote. Remove it, or set
+  `REMOTE_DIR` to a directory in your home folder.
 - **"Upload failed: Permission denied (publickey…)".** Run
   `ssh -o BatchMode=yes <host> true` in a terminal. Note that the script
   inherits iTerm2's environment, not your shell's: if your shell rc sets
@@ -139,8 +171,8 @@ Script output and Python errors also show in Scripts → Manage → Console.
 ```
 
 Then quit iTerm2 (or stop the script under Scripts → Manage), and remove the
-key binding. Screenshots left on remotes are in `/tmp/shotdrop`; macOS also
-clears old files in `/tmp` on its own.
+key binding. Screenshots left on remotes are in `/tmp/shotdrop`. Most systems
+also clear old files from `/tmp` on their own.
 
 ## Development
 
@@ -149,3 +181,9 @@ The ssh argument parser has unit tests that run with any Python 3:
 ```sh
 python3 -m unittest -v
 ```
+
+## License
+
+Public domain, under [The Unlicense](LICENSE). The author claims no ownership:
+anyone may use, copy, modify and distribute this code for any purpose, without
+conditions. It comes with no warranty of any kind.

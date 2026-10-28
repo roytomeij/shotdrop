@@ -37,11 +37,21 @@ UPLOAD_TIMEOUT = 30            # Seconds before the upload is killed.
 
 LOG_PATH = os.path.expanduser("~/Library/Logs/shotdrop.log")
 SCREENCAPTURE = "/usr/sbin/screencapture"
-SSH = "/usr/bin/ssh"  # Apple's ssh, which understands UseKeychain in ~/.ssh/config.
+# Used when the tab's ssh binary can't be determined. Apple's ssh understands
+# UseKeychain in ~/.ssh/config.
+DEFAULT_SSH = "/usr/bin/ssh"
 
 # Scripts launched by iTerm2 don't get your shell's PATH. Add the usual
 # locations so tmux, and any ProxyCommand helpers from ~/.ssh/config, resolve.
 EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+# Environment variables copied from the tab's ssh (or tmux) process, so the
+# upload uses the same agent and the tmux query finds the same server even if
+# your shell rc sets them differently from iTerm2's own environment. macOS
+# hides the environment of Apple's own binaries (including /usr/bin/ssh), so
+# this only helps with e.g. Homebrew's ssh and tmux; otherwise iTerm2's
+# environment is used as is.
+INHERITED_ENV = ["SSH_AUTH_SOCK", "TMUX_TMPDIR"]
 
 # ssh(1) option grammar: these flags take an argument.
 SSH_ARG_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
@@ -89,7 +99,7 @@ class ShotDropError(Exception):
 # --- ssh argument parsing ----------------------------------------------------
 
 def parse_ssh_args(argv):
-    """Parse an ssh command line into (connection_options, destination).
+    """Parse an ssh command line into (options, destination, trailing_options).
 
     `argv` is the full argument vector including argv[0]. Follows OpenSSH's
     own parsing: options are read until the first non-option (the
@@ -97,9 +107,14 @@ def parse_ssh_args(argv):
     next non-option, which starts the remote command. `--` ends option
     parsing. Flags may be bundled (`-tA`) and values attached (`-p2222`).
 
+    Options after the destination are returned separately: ssh keeps the
+    first value it sees, so `ssh me@host -l other` connects as `me`, and the
+    upload has to repeat them in the same position.
+
     Returns None if there is no destination (e.g. `ssh -V`).
     """
     options = []
+    trailing = []
     destination = None
     args = list(argv[1:])
     i = 0
@@ -112,6 +127,7 @@ def parse_ssh_args(argv):
                 destination = args[i + 1]
             break
         if arg.startswith("-") and len(arg) > 1:
+            kept = options if destination is None else trailing
             j = 1
             while j < len(arg):
                 flag = arg[j]
@@ -123,10 +139,10 @@ def parse_ssh_args(argv):
                             return None  # Flag missing its argument.
                         value = args[i]
                     if _keep_option(flag, value):
-                        options += ["-" + flag, value]
+                        kept += ["-" + flag, value]
                     break  # The rest of this word was the value.
                 if flag in KEEP_NOARG_FLAGS:
-                    options.append("-" + flag)
+                    kept.append("-" + flag)
                 j += 1
             i += 1
             continue
@@ -136,7 +152,7 @@ def parse_ssh_args(argv):
         i += 1
     if not destination:
         return None
-    return options, destination
+    return options, destination, trailing
 
 
 def _keep_option(flag, value):
@@ -188,37 +204,67 @@ def tmux_socket_args(argv):
     return result
 
 
-def build_remote_command(remote_path):
-    """The shell command run on the remote to store stdin at `remote_path`."""
-    remote_dir = shlex.quote(REMOTE_DIR)
-    return (
-        f"umask 077; mkdir -p {remote_dir} && cat > {shlex.quote(remote_path)} || exit 1; "
-        f"find {remote_dir} -name '*.png' -mtime +{int(RETENTION_DAYS)} -delete 2>/dev/null; "
-        "exit 0"
+def build_remote_command(filename, size):
+    """The command run on the remote to store stdin as REMOTE_DIR/filename.
+
+    Run through /bin/sh so it works whatever the remote login shell is. The
+    directory may live in a shared location like /tmp, so it must be a real
+    directory owned by us; otherwise another user could pre-create it and
+    read, swap or redirect the screenshot. The file is written under a
+    temporary name with noclobber and only moved into place once all `size`
+    bytes have arrived, so an interrupted upload never leaves a truncated PNG.
+    """
+    script = (
+        'umask 077; d=$1; f=$2; n=$3; days=$4\n'
+        'mkdir -p "$d" 2>/dev/null\n'
+        'if [ -L "$d" ] || [ ! -d "$d" ] || [ ! -O "$d" ]; then\n'
+        '  echo "$d is not a directory owned by you" >&2; exit 1\n'
+        'fi\n'
+        'chmod 700 "$d" || exit 1\n'
+        'set -C\n'
+        'if cat > "$d/$f.part" && [ "$(wc -c < "$d/$f.part" | tr -d " ")" = "$n" ]; then\n'
+        '  mv "$d/$f.part" "$d/$f" || exit 1\n'
+        'else\n'
+        '  rm -f "$d/$f.part"; echo "upload incomplete" >&2; exit 1\n'
+        'fi\n'
+        'find "$d" \\( -name "*.png" -o -name "*.part" \\) -mtime +"$days" -delete 2>/dev/null\n'
+        'exit 0\n'
     )
+    return shlex.join(["/bin/sh", "-c", script, "shotdrop",
+                       REMOTE_DIR, filename, str(int(size)), str(int(RETENTION_DAYS))])
 
 
-def build_upload_argv(options, destination, remote_path):
-    return [SSH, *UPLOAD_SSH_OPTIONS, *options, "--", destination,
-            build_remote_command(remote_path)]
+def build_upload_argv(ssh_binary, options, destination, trailing, filename, size):
+    argv = [ssh_binary, *UPLOAD_SSH_OPTIONS, *options]
+    if destination.startswith("-"):
+        argv += ["--", destination]  # Only reachable via `ssh -- -host`.
+    else:
+        argv += [destination, *trailing]
+    return argv + [build_remote_command(filename, size)]
 
 
 # --- Process inspection ------------------------------------------------------
 
 class Process:
-    def __init__(self, pid, ppid, args):
+    def __init__(self, pid, ppid, pgid, tpgid, args, argv=None):
         self.pid = pid
         self.ppid = ppid
-        self.args = args  # As printed by ps: argv joined with spaces.
-        self._argv = None
+        self.pgid = pgid
+        self.tpgid = tpgid  # Foreground process group of its terminal (0 if none).
+        self.args = args    # As printed by ps: argv joined with spaces.
+        self._argv = argv
         self._exe = None
+        self._env = {}
+        self.exact = argv is not None  # True if argv is the real argument vector.
 
     def _load(self):
         if self._argv is None:
-            exe, argv = read_proc_args(self.pid)
-            # Fall back to ps' rendering, which loses quoting of arguments
-            # containing spaces but is fine for the common case.
+            exe, argv, env = read_proc_args(self.pid)
             self._exe = exe
+            self._env = env or {}
+            self.exact = argv is not None
+            # Fall back to ps' rendering, which loses quoting of arguments
+            # containing spaces but is fine for recognising the program.
             self._argv = argv or self.args.split()
 
     @property
@@ -232,39 +278,62 @@ class Process:
         return self._exe
 
     @property
+    def env(self):
+        self._load()
+        return self._env
+
+    @property
     def name(self):
         return _basename(self.args.split(None, 1)[0]) if self.args else ""
 
+    @property
+    def foreground(self):
+        return self.tpgid > 0 and self.pgid == self.tpgid
+
 
 _libc = None
+_libproc = None
+
+
+def _load_libs():
+    global _libc, _libproc
+    if _libc is None:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        _libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                                 ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+        _libc.sysctl.restype = ctypes.c_int
+    if _libproc is None:
+        _libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib")
+        _libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                          ctypes.c_void_p, ctypes.c_int]
+        _libproc.proc_pidinfo.restype = ctypes.c_int
 
 
 def read_proc_args(pid):
-    """Return (executable_path, argv) for `pid` via sysctl KERN_PROCARGS2.
+    """Return (executable_path, argv, env) for `pid` via sysctl KERN_PROCARGS2.
 
     This gives the exact argument vector, unlike ps, which joins arguments
-    with spaces. Returns (None, None) on failure.
+    with spaces. Returns (None, None, None) on failure.
     """
-    global _libc
     try:
-        if _libc is None:
-            _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        _load_libs()
         CTL_KERN, KERN_ARGMAX, KERN_PROCARGS2 = 1, 8, 49
 
         argmax = ctypes.c_int(0)
         size = ctypes.c_size_t(ctypes.sizeof(argmax))
         mib = (ctypes.c_int * 2)(CTL_KERN, KERN_ARGMAX)
         if _libc.sysctl(mib, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
-            return None, None
+            return None, None, None
 
         buf = ctypes.create_string_buffer(argmax.value)
         size = ctypes.c_size_t(argmax.value)
         mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
         if _libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-            return None, None
+            return None, None, None
         data = buf.raw[:size.value]
 
-        # Layout: int argc, executable path, NUL padding, argv[0..argc-1], env...
+        # Layout: int argc, executable path, NUL padding, argv[0..argc-1],
+        # then environment strings until an empty string.
         (argc,) = struct.unpack_from("i", data, 0)
         pos = 4
         end = data.index(b"\0", pos)
@@ -277,19 +346,49 @@ def read_proc_args(pid):
             end = data.index(b"\0", pos)
             argv.append(data[pos:end].decode("utf-8", "replace"))
             pos = end + 1
-        return exe, argv
+        env = {}
+        while pos < len(data):
+            end = data.find(b"\0", pos)
+            if end <= pos:
+                break
+            key, sep, value = data[pos:end].decode("utf-8", "replace").partition("=")
+            if sep:
+                env.setdefault(key, value)
+            pos = end + 1
+        return exe, argv, env
     except Exception:
         log.debug("read_proc_args(%s) failed", pid, exc_info=True)
-        return None, None
+        return None, None, None
 
 
-async def run(argv, stdin=None, timeout=None):
+def process_cwd(pid):
+    """Return the working directory of `pid`, or None."""
+    PROC_PIDVNODEPATHINFO = 9
+    # struct proc_vnodepathinfo: two vnode_info_path (cwd, root), each a
+    # 152-byte vnode_info followed by a MAXPATHLEN (1024) path.
+    VNODE_INFO_SIZE, MAXPATHLEN = 152, 1024
+    size = 2 * (VNODE_INFO_SIZE + MAXPATHLEN)
+    try:
+        _load_libs()
+        buf = ctypes.create_string_buffer(size)
+        if _libproc.proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, buf, size) != size:
+            return None
+        path = buf.raw[VNODE_INFO_SIZE:VNODE_INFO_SIZE + MAXPATHLEN].split(b"\0", 1)[0]
+        path = path.decode("utf-8", "replace")
+        return path if os.path.isabs(path) and os.path.isdir(path) else None
+    except Exception:
+        log.debug("process_cwd(%s) failed", pid, exc_info=True)
+        return None
+
+
+async def run(argv, timeout=None, env=None):
     """Run a command; return (returncode, stdout, stderr) as text."""
     proc = await asyncio.create_subprocess_exec(
         *argv,
-        stdin=stdin if stdin is not None else asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
@@ -300,25 +399,33 @@ async def run(argv, stdin=None, timeout=None):
     return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
+def env_with(overrides):
+    env = dict(os.environ)
+    env.update({k: v for k, v in overrides.items() if k in INHERITED_ENV and v})
+    return env
+
+
 async def process_table():
-    code, out, err = await run(["/bin/ps", "-A", "-ww", "-o", "pid=,ppid=,args="])
+    code, out, err = await run(["/bin/ps", "-A", "-ww", "-o", "pid=,ppid=,pgid=,tpgid=,args="])
     if code != 0:
         raise ShotDropError("ShotDrop", f"ps failed: {err.strip()}")
     table = {}
     for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 2:
+        parts = line.split(None, 4)
+        if len(parts) < 4:
             continue
-        pid, ppid = int(parts[0]), int(parts[1])
-        table[pid] = Process(pid, ppid, parts[2] if len(parts) > 2 else "")
+        pid, ppid, pgid, tpgid = (int(p) for p in parts[:4])
+        table[pid] = Process(pid, ppid, pgid, tpgid, parts[4] if len(parts) > 4 else "")
     return table
 
 
 def find_ssh(table, root_pid):
-    """Find the ssh process in the tree rooted at `root_pid`.
+    """Find the foreground ssh process in the tree rooted at `root_pid`.
 
-    Searches breadth-first, so the topmost ssh wins, and skips ssh processes
-    whose parent is ssh (ProxyJump spawns `ssh -W ...` children).
+    Only ssh processes in their terminal's foreground process group count, so
+    a backgrounded or suspended `ssh -N tunnel &` in the same shell is never
+    picked. Searches breadth-first, so the topmost ssh wins, and skips ssh
+    processes whose parent is ssh (ProxyJump spawns `ssh -W ...` children).
     """
     children = {}
     for proc in table.values():
@@ -327,14 +434,30 @@ def find_ssh(table, root_pid):
     while queue:
         proc = queue.pop(0)
         parent = table.get(proc.ppid)
-        if proc.name == "ssh" and not (parent and parent.name == "ssh") and is_ssh(proc.argv):
+        if (proc.name == "ssh" and proc.foreground
+                and not (parent and parent.name == "ssh") and is_ssh(proc.argv)):
             return proc
-        queue.extend(sorted(children.get(proc.pid, []), key=lambda p: p.pid))
+        queue.extend(children.get(proc.pid, []))
     return None
 
 
-async def find_ssh_destination(session):
-    """Return (options, destination) for the ssh connection in `session`."""
+class Target:
+    """Where the screenshot goes and how to reach it."""
+
+    def __init__(self, ssh, parsed, tmux=None, pane_id=None):
+        self.ssh = ssh
+        self.options, self.destination, self.trailing = parsed
+        self.tmux = tmux          # (tmux argv prefix, env) when the tab runs local tmux.
+        self.pane_id = pane_id    # The tmux pane the hotkey was pressed in.
+
+    @property
+    def ssh_binary(self):
+        exe = self.ssh.exe
+        return exe if exe and os.path.isabs(exe) and os.access(exe, os.X_OK) else DEFAULT_SSH
+
+
+async def find_target(session):
+    """Find the ssh connection in `session`."""
     job_pid = await session.async_get_variable("jobPid")
     tty = await session.async_get_variable("tty")
     log.info("session %s: jobPid=%r tty=%r", session.session_id, job_pid, tty)
@@ -351,36 +474,49 @@ async def find_ssh_destination(session):
                             f"Job process {job_pid} is gone.")
 
     root_pid = job_pid
+    tmux = pane_id = None
     if is_tmux(job.argv):
         # Case B: the tab runs a local tmux client; look inside its active pane.
-        root_pid = await tmux_active_pane_pid(job, tty)
-        log.info("local tmux client %s, active pane pid %s", job_pid, root_pid)
+        tmux = (local_tmux_argv(job), env_with(job.env))
+        root_pid, pane_id = await tmux_active_pane(tmux, tty)
+        log.info("local tmux client %s, active pane %s (pid %s)", job_pid, pane_id, root_pid)
 
     ssh = find_ssh(table, root_pid)
     if ssh is None:
         raise ShotDropError("No SSH connection found in this tab",
                             "Run ShotDrop in a tab (or tmux pane) running ssh.")
+    if not ssh.exact:
+        # Without the exact argv, an argument containing spaces could be
+        # mistaken for the destination and the screenshot sent elsewhere.
+        raise ShotDropError("Couldn't read the ssh command line",
+                            f"Process {ssh.pid}: {ssh.args}")
     parsed = parse_ssh_args(ssh.argv)
     if parsed is None:
         raise ShotDropError("No SSH connection found in this tab",
                             f"Couldn't find a destination in: {ssh.args}")
-    log.info("ssh pid %s argv=%r -> options=%r destination=%r",
-             ssh.pid, ssh.argv, parsed[0], parsed[1])
-    return parsed
+    log.info("ssh pid %s argv=%r -> options=%r destination=%r trailing=%r",
+             ssh.pid, ssh.argv, *parsed)
+    return Target(ssh, parsed, tmux, pane_id)
 
 
-async def tmux_active_pane_pid(client, tty):
-    """Ask the local tmux server for the pane_pid of the client on `tty`."""
+def local_tmux_argv(client):
+    """The tmux binary and socket options to talk to `client`'s server."""
     tmux = client.exe if client.exe and os.path.isabs(client.exe) else "tmux"
-    argv = [tmux, *tmux_socket_args(client.argv),
-            "display-message", "-c", tty, "-p", "#{pane_pid}"]
+    return [tmux, *tmux_socket_args(client.argv)]
+
+
+async def tmux_active_pane(tmux, tty):
+    """Return (pane_pid, pane_id) of the active pane of the client on `tty`."""
+    tmux_argv, env = tmux
+    argv = [*tmux_argv, "display-message", "-c", tty, "-p", "#{pane_pid} #{pane_id}"]
     try:
-        code, out, err = await run(argv, timeout=5)
+        code, out, err = await run(argv, timeout=5, env=env)
     except (OSError, asyncio.TimeoutError) as e:
         raise ShotDropError("Couldn't query local tmux", str(e))
-    if code != 0 or not out.strip().isdigit():
+    fields = out.split()
+    if code != 0 or len(fields) != 2 or not fields[0].isdigit():
         raise ShotDropError("Couldn't query local tmux", err.strip() or out.strip())
-    return int(out.strip())
+    return int(fields[0]), fields[1]
 
 
 # --- Capture, upload, insert -------------------------------------------------
@@ -393,14 +529,29 @@ async def capture(path):
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 
-async def upload(local_path, options, destination, remote_path):
-    argv = build_upload_argv(options, destination, remote_path)
-    log.info("upload: %s", shlex.join(argv))
-    with open(local_path, "rb") as f:
+async def upload(target, local_path, filename):
+    size = os.path.getsize(local_path)
+    argv = build_upload_argv(target.ssh_binary, target.options, target.destination,
+                             target.trailing, filename, size)
+    # Relative paths in the tab's options (-i ./key, -F cfg) are relative to
+    # where that ssh was started.
+    cwd = process_cwd(target.ssh.pid)
+    log.info("upload (cwd %s): %s", cwd, shlex.join(argv))
+    # stderr goes to a file rather than a pipe: a ControlPersist master or a
+    # ProxyCommand left running in the background can hold a pipe open long
+    # after ssh itself has exited.
+    with open(local_path, "rb") as stdin, tempfile.TemporaryFile() as stderr:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdin=stdin, stdout=asyncio.subprocess.DEVNULL, stderr=stderr,
+            cwd=cwd, env=env_with(target.ssh.env))
         try:
-            code, _, err = await run(argv, stdin=f, timeout=UPLOAD_TIMEOUT)
+            code = await asyncio.wait_for(proc.wait(), UPLOAD_TIMEOUT)
         except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
             raise ShotDropError("Upload failed", f"Timed out after {UPLOAD_TIMEOUT} s.")
+        stderr.seek(0)
+        err = stderr.read().decode("utf-8", "replace")
     if code != 0:
         log.error("upload exited %s: %s", code, err.strip())
         raise ShotDropError("Upload failed", _short(err) or f"ssh exited with status {code}.")
@@ -428,6 +579,30 @@ def text_to_insert(remote_path):
     return None
 
 
+async def paste_into_tmux_pane(target, remote_path):
+    """Paste into the pane the hotkey was pressed in, even if you've moved on.
+
+    `paste-buffer -p` adds bracketed-paste markers only if the program in the
+    pane asked for them, so they can't turn into stray keystrokes.
+    """
+    tmux_argv, env = target.tmux
+    proc = await asyncio.create_subprocess_exec(
+        *tmux_argv, "load-buffer", "-b", "shotdrop", "-",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE, env=env)
+    _, err = await asyncio.wait_for(proc.communicate(remote_path.encode()), 5)
+    if proc.returncode == 0:
+        flags = ["-p"] if INSERT_MODE == "bracketed" else []
+        code, _, err = await run([*tmux_argv, "paste-buffer", "-d", *flags, "-b", "shotdrop",
+                                  "-t", target.pane_id], timeout=5, env=env)
+        if code == 0:
+            return
+    else:
+        err = err.decode("utf-8", "replace")
+    raise ShotDropError("Couldn't paste into tmux",
+                        f"{_short(err)} The path is on the clipboard.")
+
+
 def remote_filename():
     now = datetime.datetime.now()
     # Milliseconds keep two shots taken in the same second apart.
@@ -436,7 +611,7 @@ def remote_filename():
 
 async def capture_and_upload(session):
     """The whole flow. Raises ShotDropError for errors to show the user."""
-    options, destination = await find_ssh_destination(session)
+    target = await find_target(session)
 
     fd, local_path = tempfile.mkstemp(prefix="shotdrop-", suffix=".png")
     os.close(fd)
@@ -444,9 +619,10 @@ async def capture_and_upload(session):
         if not await capture(local_path):
             log.info("capture cancelled")
             return
-        remote_path = f"{REMOTE_DIR.rstrip('/')}/{remote_filename()}"
-        await upload(local_path, options, destination, remote_path)
-        log.info("uploaded to %s:%s", destination, remote_path)
+        filename = remote_filename()
+        await upload(target, local_path, filename)
+        remote_path = f"{REMOTE_DIR.rstrip('/')}/{filename}"
+        log.info("uploaded to %s:%s", target.destination, remote_path)
     finally:
         try:
             os.unlink(local_path)
@@ -454,9 +630,12 @@ async def capture_and_upload(session):
             pass
 
     await copy_to_clipboard(remote_path)
+    # No newline in either case: you add your own prompt text before submitting.
+    if target.pane_id and INSERT_MODE in ("bracketed", "typed"):
+        await paste_into_tmux_pane(target, remote_path)
+        return
     text = text_to_insert(remote_path)
     if text:
-        # No newline: you add your own prompt text before submitting.
         await session.async_send_text(text, suppress_broadcast=True)
 
 
@@ -464,7 +643,14 @@ async def capture_and_upload(session):
 
 def setup_logging():
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=1)
+    # The log records ssh command lines, which may contain secrets (e.g. in a
+    # ProxyCommand), so keep it private.
+    old_umask = os.umask(0o077)
+    try:
+        handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=1)
+    finally:
+        os.umask(old_umask)
+    os.chmod(LOG_PATH, 0o600)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     log.addHandler(handler)
     log.setLevel(logging.INFO)
