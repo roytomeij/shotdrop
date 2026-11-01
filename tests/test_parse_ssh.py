@@ -12,8 +12,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import shotdrop  # noqa: E402
 from shotdrop import (  # noqa: E402
-    Process, build_remote_command, build_upload_argv, find_ssh, parse_ssh_args,
-    process_cwd, read_proc_args, tmux_socket_args,
+    Process, build_remote_command, build_upload_argv, find_ssh, parse_remote_path,
+    parse_ssh_args, process_cwd, read_proc_args, tmux_socket_args,
 )
 
 
@@ -115,9 +115,9 @@ class RemoteCommandTest(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.dir = os.path.join(self.tmp.name, "shotdrop")
         self._old = shotdrop.REMOTE_DIR
-        shotdrop.REMOTE_DIR = self.dir
+        shotdrop.REMOTE_DIR = os.path.join(self.tmp.name, "shotdrop")
+        self.dir = f"{shotdrop.REMOTE_DIR}-{os.getuid()}"
 
     def tearDown(self):
         shotdrop.REMOTE_DIR = self._old
@@ -130,6 +130,8 @@ class RemoteCommandTest(unittest.TestCase):
     def test_stores_file_in_private_directory(self):
         result = self.run_remote(b"png bytes")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(parse_remote_path(result.stdout.decode(), "x.png"),
+                         os.path.join(self.dir, "x.png"))
         with open(os.path.join(self.dir, "x.png"), "rb") as f:
             self.assertEqual(f.read(), b"png bytes")
         self.assertEqual(os.stat(self.dir).st_mode & 0o777, 0o700)
@@ -150,15 +152,42 @@ class RemoteCommandTest(unittest.TestCase):
         self.assertIn(b"not a directory owned by you", result.stderr)
         self.assertEqual(os.listdir(elsewhere), [])
 
+    def test_ignores_directory_of_other_uid(self):
+        # Stands in for a /tmp/shotdrop left by another user: no longer in the way.
+        os.mkdir(shotdrop.REMOTE_DIR)
+        os.chmod(shotdrop.REMOTE_DIR, 0o500)
+        self.assertEqual(self.run_remote(b"data").returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "x.png")))
+
+    def test_trailing_slash_in_remote_dir(self):
+        shotdrop.REMOTE_DIR += "/"
+        result = self.run_remote(b"data")
+        self.assertEqual(parse_remote_path(result.stdout.decode(), "x.png"),
+                         os.path.join(self.dir, "x.png"))
+
     def test_incomplete_upload_leaves_nothing(self):
         result = self.run_remote(b"short", size=100)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(os.listdir(self.dir), [])
+        self.assertIsNone(parse_remote_path(result.stdout.decode(), "x.png"))
 
     def test_quotes_awkward_names(self):
         shotdrop.REMOTE_DIR = os.path.join(self.tmp.name, "it's $HOME; dir")
-        self.assertEqual(self.run_remote(b"data", filename="a b.png").returncode, 0)
-        self.assertTrue(os.path.exists(os.path.join(shotdrop.REMOTE_DIR, "a b.png")))
+        result = self.run_remote(b"data", filename="a b.png")
+        self.assertEqual(result.returncode, 0)
+        path = f"{shotdrop.REMOTE_DIR}-{os.getuid()}/a b.png"
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(parse_remote_path(result.stdout.decode(), "a b.png"), path)
+
+
+class ParseRemotePathTest(unittest.TestCase):
+    def test_ignores_login_script_output(self):
+        out = "Welcome!\nno newline here\nshotdrop-path:/tmp/shotdrop-501/x.png\n"
+        self.assertEqual(parse_remote_path(out, "x.png"), "/tmp/shotdrop-501/x.png")
+
+    def test_missing_or_mismatched_path(self):
+        self.assertIsNone(parse_remote_path("", "x.png"))
+        self.assertIsNone(parse_remote_path("shotdrop-path:/tmp/other.png\n", "x.png"))
 
 
 def proc(pid, ppid, args, pgid=None, tpgid=100):

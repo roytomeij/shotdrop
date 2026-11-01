@@ -28,8 +28,8 @@ import tempfile
 
 # --- Config -----------------------------------------------------------------
 
-REMOTE_DIR = "/tmp/shotdrop"   # Absolute path on the remote; created if missing.
-RETENTION_DAYS = 7             # Older screenshots in REMOTE_DIR are deleted on upload.
+REMOTE_DIR = "/tmp/shotdrop"   # Absolute path on the remote; "-<uid>" is appended.
+RETENTION_DAYS = 7             # Older screenshots there are deleted on upload.
 INSERT_MODE = "bracketed"      # "bracketed" | "typed" | "none"
 UPLOAD_TIMEOUT = 30            # Seconds before the upload is killed.
 
@@ -80,6 +80,10 @@ UPLOAD_SSH_OPTIONS = [
     "-o", "ClearAllForwardings=yes",  # Don't try to re-bind the tab's port forwards.
     "-o", "PermitLocalCommand=no",
 ]
+
+# The remote script prints the stored file's path after this marker, so it can
+# be told apart from anything a login script prints to stdout.
+PATH_MARKER = "shotdrop-path:"
 
 BRACKETED_PASTE_START = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
@@ -205,17 +209,22 @@ def tmux_socket_args(argv):
 
 
 def build_remote_command(filename, size):
-    """The command run on the remote to store stdin as REMOTE_DIR/filename.
+    """The command run on the remote to store stdin as REMOTE_DIR-<uid>/filename.
 
     Run through /bin/sh so it works whatever the remote login shell is. The
     directory may live in a shared location like /tmp, so it must be a real
     directory owned by us; otherwise another user could pre-create it and
-    read, swap or redirect the screenshot. The file is written under a
-    temporary name with noclobber and only moved into place once all `size`
-    bytes have arrived, so an interrupted upload never leaves a truncated PNG.
+    read, swap or redirect the screenshot. The remote uid is part of its name,
+    so different users on one host (you and root, say) each get their own
+    instead of locking each other out. The file is written under a temporary
+    name with noclobber and only moved into place once all `size` bytes have
+    arrived, so an interrupted upload never leaves a truncated PNG. The final
+    path is printed after PATH_MARKER.
     """
     script = (
-        'umask 077; d=$1; f=$2; n=$3; days=$4\n'
+        'umask 077; f=$2; n=$3; days=$4\n'
+        'u=$(id -u) && [ -n "$u" ] || { echo "couldn\'t determine remote uid" >&2; exit 1; }\n'
+        'd=$1-$u\n'
         'mkdir -p "$d" 2>/dev/null\n'
         'if [ -L "$d" ] || [ ! -d "$d" ] || [ ! -O "$d" ]; then\n'
         '  echo "$d is not a directory owned by you" >&2; exit 1\n'
@@ -224,6 +233,8 @@ def build_remote_command(filename, size):
         'set -C\n'
         'if cat > "$d/$f.part" && [ "$(wc -c < "$d/$f.part" | tr -d " ")" = "$n" ]; then\n'
         '  mv "$d/$f.part" "$d/$f" || exit 1\n'
+        # Leading newline: a login script may have printed text without one.
+        f'  printf \'\\n{PATH_MARKER}%s\\n\' "$d/$f"\n'
         'else\n'
         '  rm -f "$d/$f.part"; echo "upload incomplete" >&2; exit 1\n'
         'fi\n'
@@ -231,7 +242,16 @@ def build_remote_command(filename, size):
         'exit 0\n'
     )
     return shlex.join(["/bin/sh", "-c", script, "shotdrop",
-                       REMOTE_DIR, filename, str(int(size)), str(int(RETENTION_DAYS))])
+                       REMOTE_DIR.rstrip("/"), filename, str(int(size)), str(int(RETENTION_DAYS))])
+
+
+def parse_remote_path(stdout, filename):
+    """The path the remote script reported storing `filename` at, or None."""
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(PATH_MARKER):
+            path = line[len(PATH_MARKER):]
+            return path if path.endswith("/" + filename) else None
+    return None
 
 
 def build_upload_argv(ssh_binary, options, destination, trailing, filename, size):
@@ -530,6 +550,7 @@ async def capture(path):
 
 
 async def upload(target, local_path, filename):
+    """Store the file on the remote; return its path there."""
     size = os.path.getsize(local_path)
     argv = build_upload_argv(target.ssh_binary, target.options, target.destination,
                              target.trailing, filename, size)
@@ -537,12 +558,13 @@ async def upload(target, local_path, filename):
     # where that ssh was started.
     cwd = process_cwd(target.ssh.pid)
     log.info("upload (cwd %s): %s", cwd, shlex.join(argv))
-    # stderr goes to a file rather than a pipe: a ControlPersist master or a
+    # Output goes to files rather than pipes: a ControlPersist master or a
     # ProxyCommand left running in the background can hold a pipe open long
     # after ssh itself has exited.
-    with open(local_path, "rb") as stdin, tempfile.TemporaryFile() as stderr:
+    with open(local_path, "rb") as stdin, tempfile.TemporaryFile() as stdout, \
+            tempfile.TemporaryFile() as stderr:
         proc = await asyncio.create_subprocess_exec(
-            *argv, stdin=stdin, stdout=asyncio.subprocess.DEVNULL, stderr=stderr,
+            *argv, stdin=stdin, stdout=stdout, stderr=stderr,
             cwd=cwd, env=env_with(target.ssh.env))
         try:
             code = await asyncio.wait_for(proc.wait(), UPLOAD_TIMEOUT)
@@ -550,11 +572,18 @@ async def upload(target, local_path, filename):
             proc.kill()
             await proc.wait()
             raise ShotDropError("Upload failed", f"Timed out after {UPLOAD_TIMEOUT} s.")
+        stdout.seek(0)
+        out = stdout.read().decode("utf-8", "replace")
         stderr.seek(0)
         err = stderr.read().decode("utf-8", "replace")
     if code != 0:
         log.error("upload exited %s: %s", code, err.strip())
         raise ShotDropError("Upload failed", _short(err) or f"ssh exited with status {code}.")
+    remote_path = parse_remote_path(out, filename)
+    if remote_path is None:
+        log.error("no path in upload output: %r", out)
+        raise ShotDropError("Upload failed", "The remote didn't report where it stored the file.")
+    return remote_path
 
 
 def _short(text, limit=300):
@@ -620,8 +649,7 @@ async def capture_and_upload(session):
             log.info("capture cancelled")
             return
         filename = remote_filename()
-        await upload(target, local_path, filename)
-        remote_path = f"{REMOTE_DIR.rstrip('/')}/{filename}"
+        remote_path = await upload(target, local_path, filename)
         log.info("uploaded to %s:%s", target.destination, remote_path)
     finally:
         try:

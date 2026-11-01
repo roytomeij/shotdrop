@@ -46,9 +46,11 @@ turns a pasted image path into an `[Image #1]` attachment.
    (`-t -L -R -D -N -f -v` …) as well as any remote command.
 2. Runs `screencapture -i`. Esc cancels silently.
 3. Uploads with `ssh` itself, so the options are reused verbatim:
-   `ssh -o BatchMode=yes … <dest> '/bin/sh -c …'`. The remote script checks
-   that `/tmp/shotdrop` is a real directory owned by you, so another user on
-   the remote can't intercept the file. It writes to a temporary name and only
+   `ssh -o BatchMode=yes … <dest> '/bin/sh -c …'`. The remote script stores
+   the file in `/tmp/shotdrop-<uid>`, named after the remote user so that two
+   users on one host (you and root, say) never get in each other's way. It
+   checks that this is a real directory owned by you, so another user on the
+   remote can't intercept the file. It writes to a temporary name and only
    moves the file into place once every byte has arrived. On the same
    connection it deletes screenshots older than 7 days.
 4. Pastes the remote path, with no newline so you can type your prompt after
@@ -121,8 +123,8 @@ At the top of `shotdrop.py`:
 
 | Setting          | Default           | Meaning |
 |------------------|-------------------|---------|
-| `REMOTE_DIR`     | `"/tmp/shotdrop"` | Absolute directory on the remote. Must be owned by you; it's created if missing and set to mode 700. |
-| `RETENTION_DAYS` | `7`               | Older `.png` files in `REMOTE_DIR` are deleted on each upload. |
+| `REMOTE_DIR`     | `"/tmp/shotdrop"` | Absolute directory on the remote, with `-<uid>` of the remote user appended (e.g. `/tmp/shotdrop-501`). Must be owned by you; it's created if missing and set to mode 700. |
+| `RETENTION_DAYS` | `7`               | Older `.png` files in that directory are deleted on each upload. |
 | `INSERT_MODE`    | `"bracketed"`     | `"bracketed"`: paste the path (gives `[Image #N]` in Claude Code). `"typed"`: type the plain path (Claude still reads the file, without the attachment pill). `"none"`: clipboard only. |
 | `UPLOAD_TIMEOUT` | `30`              | Seconds before the upload is aborted. |
 
@@ -149,9 +151,14 @@ Script output and Python errors also show in Scripts → Manage → Console.
 - **"Couldn't read the ssh command line".** macOS didn't return the exact
   arguments of the tab's ssh process. ShotDrop refuses to guess, so the
   screenshot can't end up on the wrong host.
-- **"Upload failed: /tmp/shotdrop is not a directory owned by you".** Someone
-  else (or a symlink) owns that path on the remote. Remove it, or set
-  `REMOTE_DIR` to a directory in your home folder.
+- **"Upload failed: /tmp/shotdrop-501 is not a directory owned by you".**
+  Since the directory name includes your uid, another user doesn't end up
+  owning it by accident. Something at that path is a symlink, a file, or was
+  created by someone else on purpose. Look at it with `ls -ld` on the remote
+  before removing it.
+- **"Upload failed: The remote didn't report where it stored the file".** The
+  upload ran but the path line never arrived. Check the log for the remote's
+  output.
 - **"Upload failed: Permission denied (publickey…)".** Run
   `ssh -o BatchMode=yes <host> true` in a terminal. Note that the script
   inherits iTerm2's environment, not your shell's: if your shell rc sets
@@ -175,7 +182,8 @@ Script output and Python errors also show in Scripts → Manage → Console.
 ```
 
 Then quit iTerm2 (or stop the script under Scripts → Manage), and remove the
-key binding. Screenshots left on remotes are in `/tmp/shotdrop`. Most systems
+key binding. Screenshots left on remotes are in `/tmp/shotdrop-<uid>` (older
+versions used `/tmp/shotdrop`). Most systems
 also clear old files from `/tmp` on their own.
 
 ## Development
