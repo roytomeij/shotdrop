@@ -24,7 +24,7 @@ case "${1:-}" in
     rm -f "$DEST"  # Replaces a symlink instead of copying onto its target.
     cp "$SRC" "$DEST"
     echo "Installed $DEST"
-    echo "Quit and reopen iTerm2 to load it (this also replaces a running older copy)."
+    echo "Reload it: Scripts → Manage → Console → select shotdrop.py → Restart (or quit and reopen iTerm2)."
     ;;
   *)
     echo "usage: $0 [--uninstall]" >&2

@@ -9,6 +9,10 @@ it into an [Image #N] attachment) and copied to the local clipboard.
 Install as an iTerm2 AutoLaunch script and bind a key to the iTerm2 action
 "Invoke Script Function" with:  shotdrop(session_id: id)
 
+It also adds "Open Remote Image" to the terminal's right-click menu: it
+downloads an image path shown in the tab (such as one Claude Code printed) over
+the tab's ssh connection and opens it locally.
+
 This is a "basic" script: it only needs the standard library plus the `iterm2`
 module that ships with iTerm2's Python runtime. Everything except main() is
 importable without iTerm2, so the ssh argument parser can be unit tested with
@@ -19,9 +23,11 @@ import asyncio
 import ctypes
 import ctypes.util
 import datetime
+import hashlib
 import logging
 import logging.handlers
 import os
+import re
 import shlex
 import struct
 import tempfile
@@ -32,6 +38,10 @@ REMOTE_DIR = "/tmp/shotdrop"   # Absolute path on the remote; "-<uid>" is append
 RETENTION_DAYS = 7             # Older screenshots there are deleted on upload.
 INSERT_MODE = "bracketed"      # "bracketed" | "typed" | "none"
 UPLOAD_TIMEOUT = 30            # Seconds before the upload is killed.
+# "Open Remote Image" (right-click menu) downloads images here and opens them.
+DOWNLOAD_DIR = "~/Library/Caches/shotdrop"  # Files older than RETENTION_DAYS are deleted.
+DOWNLOAD_TIMEOUT = 30          # Seconds before a download is killed.
+MAX_DOWNLOAD_MB = 50           # Larger remote files are refused.
 
 # --- Constants --------------------------------------------------------------
 
@@ -63,17 +73,18 @@ KEEP_ARG_FLAGS = set("BbcFIiJlmoPpS")
 KEEP_NOARG_FLAGS = set("46CKk")
 
 # `-o` options that would break a one-shot upload command. Dropped from the
-# tab's command line; our own overrides (UPLOAD_SSH_OPTIONS) also take care of
-# the same settings coming from ~/.ssh/config.
+# tab's command line; our own overrides (SSH_OVERRIDES) also take care of the
+# same settings coming from ~/.ssh/config.
 DROP_O_KEYS = {
     "remotecommand", "requesttty", "localforward", "remoteforward",
     "dynamicforward", "localcommand", "permitlocalcommand", "sessiontype",
     "forkafterauthentication", "stdinnull", "controlmaster", "batchmode",
 }
 
-# Passed before the kept options. ssh uses the first value it sees for an
-# option, so these win over both the tab's options and ~/.ssh/config.
-UPLOAD_SSH_OPTIONS = [
+# Passed to uploads and downloads before the kept options. ssh uses the first
+# value it sees for an option, so these win over both the tab's options and
+# ~/.ssh/config.
+SSH_OVERRIDES = [
     "-o", "BatchMode=yes",            # Fail fast instead of prompting for a password.
     "-o", "RemoteCommand=none",       # A RemoteCommand in ssh config would clash with ours.
     "-o", "RequestTTY=no",
@@ -84,6 +95,25 @@ UPLOAD_SSH_OPTIONS = [
 # The remote script prints the stored file's path after this marker, so it can
 # be told apart from anything a login script prints to stdout.
 PATH_MARKER = "shotdrop-path:"
+# Likewise, the download command prints this and the file's size before it.
+DATA_MARKER = "shotdrop-data:"
+
+# Characters accepted in a path found on screen. No spaces, quotes or
+# brackets, so the path ends where the surrounding text starts.
+_PATH_CHARS = r"[\w.~+@%=/-]"
+IMAGE_PATH_RE = re.compile(
+    rf"(?<!{_PATH_CHARS})"   # Not the tail of a longer word or path.
+    rf"(/{_PATH_CHARS}*\.(?:png|jpe?g|gif|webp|hei[cf]|tiff?|bmp))"
+    r"(?![\w~+@%=/-]|\.\w)",  # Not followed by more path: "x.png.bak", "x.png/".
+    re.IGNORECASE)
+# A path, possibly incomplete, that runs into the end of a line.
+PATH_FRAGMENT_RE = re.compile(rf"(?<!{_PATH_CHARS})/{_PATH_CHARS}*$")
+MAX_WRAPPED_LINES = 5  # How many following lines a broken path may continue on.
+
+# Names of files ShotDrop writes to DOWNLOAD_DIR (see local_image_name).
+DOWNLOAD_NAME_RE = re.compile(r"(-[0-9a-f]{12}\.(png|jpg|gif|webp|heic|tiff|bmp)|^\.download-.*)$")
+
+HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}
 
 BRACKETED_PASTE_START = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
@@ -254,13 +284,173 @@ def parse_remote_path(stdout, filename):
     return None
 
 
-def build_upload_argv(ssh_binary, options, destination, trailing, filename, size):
-    argv = [ssh_binary, *UPLOAD_SSH_OPTIONS, *options]
+def build_ssh_argv(ssh_binary, options, destination, trailing, remote_command):
+    argv = [ssh_binary, *SSH_OVERRIDES, *options]
     if destination.startswith("-"):
         argv += ["--", destination]  # Only reachable via `ssh -- -host`.
     else:
         argv += [destination, *trailing]
-    return argv + [build_remote_command(filename, size)]
+    return argv + [remote_command]
+
+
+def build_upload_argv(ssh_binary, options, destination, trailing, filename, size):
+    return build_ssh_argv(ssh_binary, options, destination, trailing,
+                          build_remote_command(filename, size))
+
+
+# --- Finding an image path on screen ----------------------------------------
+
+def find_image_paths(lines):
+    """Absolute image paths in `lines` (screen lines, top to bottom), in order.
+
+    tmux and full-screen apps such as Claude Code break long lines themselves,
+    so a path that runs into the end of a line is completed with the start of
+    the following lines, ignoring their indentation. Whatever such a path
+    takes from the next line isn't searched again, so the tail of a path that
+    happens to start with "/" isn't reported as a path of its own.
+    """
+    found = []
+    taken = {}  # Line index -> number of leading characters already used.
+    for i, line in enumerate(lines):
+        for m in IMAGE_PATH_RE.finditer(line):
+            if m.start(1) >= taken.get(i, 0):
+                found.append(m.group(1))
+        fragment = PATH_FRAGMENT_RE.search(line.rstrip())
+        if (not fragment or fragment.start() < taken.get(i, 0)
+                or IMAGE_PATH_RE.fullmatch(fragment.group())):
+            continue
+        text = fragment.group()
+        used = {}
+        for j in range(i + 1, min(i + 1 + MAX_WRAPPED_LINES, len(lines))):
+            stripped = lines[j].lstrip()
+            indent = len(lines[j]) - len(stripped)
+            stripped = stripped.rstrip()
+            if not stripped:
+                break
+            start = len(text)
+            text += stripped
+            m = IMAGE_PATH_RE.match(text)
+            if m and m.end() > start:
+                used[j] = indent + m.end() - start
+                found.append(m.group(1))
+                taken.update(used)
+                break
+            if not PATH_FRAGMENT_RE.fullmatch(text):
+                break  # The path ended on this line without becoming an image path.
+            used[j] = len(lines[j])
+    return found
+
+
+def join_soft_wraps(lines):
+    """Join (text, hard_eol) screen lines that iTerm2 wrapped itself."""
+    joined, current = [], ""
+    for text, hard_eol in lines:
+        current += text
+        if hard_eol:
+            joined.append(current)
+            current = ""
+    if current:
+        joined.append(current)
+    return joined
+
+
+def choose_image_path(selection, screen_lines):
+    """The image path to open, from the selected text and the visible lines.
+
+    A selected path wins. A selection that holds only part of a path (say,
+    because a right-click selected it up to a line break) picks the visible
+    path it's part of. Without a selection, the last path on screen is used.
+    """
+    screen_paths = find_image_paths(screen_lines)
+    if selection and selection.strip():
+        selection_lines = selection.split("\n")
+        paths = find_image_paths(selection_lines)
+        if paths:
+            return paths[-1]
+        hint = "".join(line.strip() for line in selection_lines)
+        paths = [p for p in screen_paths if hint in p]
+        if paths:
+            return paths[-1]
+        raise ShotDropError("No image path in the selection",
+                            "Select an image path (or right-click one), or clear the selection "
+                            "to open the last image path in the tab.")
+    if screen_paths:
+        return screen_paths[-1]
+    raise ShotDropError("No image path found",
+                        "Right-click an image path (such as /tmp/shot.png) shown in this tab.")
+
+
+def is_safe_remote_image_path(path):
+    """A path ShotDrop is willing to fetch: absolute, no "..", image extension."""
+    return (len(path) <= 1024 and IMAGE_PATH_RE.fullmatch(path) is not None
+            and ".." not in path.split("/"))
+
+
+# --- Downloading -------------------------------------------------------------
+
+def build_download_command(path, max_bytes):
+    """The command run on the remote to print the file at `path`.
+
+    Prints DATA_MARKER and the file's size first, so the file's bytes can be
+    told apart from anything a login script prints to stdout.
+    """
+    script = (
+        'f=$1; max=$2\n'
+        'if [ ! -f "$f" ]; then echo "$f: no such file" >&2; exit 1; fi\n'
+        'if [ ! -r "$f" ]; then echo "$f: permission denied" >&2; exit 1; fi\n'
+        'n=$(wc -c < "$f" | tr -d " ") || exit 1\n'
+        'if [ "$n" -gt "$max" ]; then echo "$f is larger than $max bytes" >&2; exit 1; fi\n'
+        # Leading newline: a login script may have printed text without one.
+        f'printf \'\\n{DATA_MARKER}%s\\n\' "$n"\n'
+        'exec cat -- "$f"\n'
+    )
+    return shlex.join(["/bin/sh", "-c", script, "shotdrop", path, str(int(max_bytes))])
+
+
+def parse_download_output(stdout):
+    """The file's bytes from the download command's stdout, or None."""
+    marker = b"\n" + DATA_MARKER.encode()
+    start = stdout.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = stdout.find(b"\n", start)
+    size = stdout[start:end]
+    if end < 0 or not size.isdigit():
+        return None
+    data = stdout[end + 1:]
+    return data if len(data) == int(size) else None
+
+
+def image_type(data):
+    """The file extension for image `data`, judged by its contents, or None."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:4] in (b"II*\0", b"MM\0*"):
+        return "tiff"
+    if data[:2] == b"BM":
+        return "bmp"
+    if data[4:8] == b"ftyp" and data[8:12] in HEIF_BRANDS:
+        return "heic"
+    return None
+
+
+def local_image_name(destination, remote_path, extension):
+    """Local file name for a downloaded image.
+
+    Keeps the remote name readable and adds a hash of host and path, so
+    equally named files from different places don't overwrite each other.
+    """
+    digest = hashlib.sha256(f"{destination}\0{remote_path}".encode()).hexdigest()[:12]
+    stem = os.path.splitext(os.path.basename(remote_path))[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")[:80] or "image"
+    return f"{stem}-{digest}.{extension}"
 
 
 # --- Process inspection ------------------------------------------------------
@@ -549,36 +739,47 @@ async def capture(path):
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 
-async def upload(target, local_path, filename):
-    """Store the file on the remote; return its path there."""
-    size = os.path.getsize(local_path)
-    argv = build_upload_argv(target.ssh_binary, target.options, target.destination,
-                             target.trailing, filename, size)
+async def run_ssh(target, remote_command, stdin, timeout, what):
+    """Run `remote_command` over the tab's connection; return (stdout bytes, stderr).
+
+    `what` names the operation ("Upload", "Download") in logs and errors.
+    """
+    argv = build_ssh_argv(target.ssh_binary, target.options, target.destination,
+                          target.trailing, remote_command)
     # Relative paths in the tab's options (-i ./key, -F cfg) are relative to
     # where that ssh was started.
     cwd = process_cwd(target.ssh.pid)
-    log.info("upload (cwd %s): %s", cwd, shlex.join(argv))
+    log.info("%s (cwd %s): %s", what.lower(), cwd, shlex.join(argv))
     # Output goes to files rather than pipes: a ControlPersist master or a
     # ProxyCommand left running in the background can hold a pipe open long
     # after ssh itself has exited.
-    with open(local_path, "rb") as stdin, tempfile.TemporaryFile() as stdout, \
-            tempfile.TemporaryFile() as stderr:
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         proc = await asyncio.create_subprocess_exec(
             *argv, stdin=stdin, stdout=stdout, stderr=stderr,
             cwd=cwd, env=env_with(target.ssh.env))
         try:
-            code = await asyncio.wait_for(proc.wait(), UPLOAD_TIMEOUT)
+            code = await asyncio.wait_for(proc.wait(), timeout)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            raise ShotDropError("Upload failed", f"Timed out after {UPLOAD_TIMEOUT} s.")
+            raise ShotDropError(f"{what} failed", f"Timed out after {timeout} s.")
         stdout.seek(0)
-        out = stdout.read().decode("utf-8", "replace")
+        out = stdout.read()
         stderr.seek(0)
         err = stderr.read().decode("utf-8", "replace")
     if code != 0:
-        log.error("upload exited %s: %s", code, err.strip())
-        raise ShotDropError("Upload failed", _short(err) or f"ssh exited with status {code}.")
+        log.error("%s exited %s: %s", what.lower(), code, err.strip())
+        raise ShotDropError(f"{what} failed", _short(err) or f"ssh exited with status {code}.")
+    return out, err
+
+
+async def upload(target, local_path, filename):
+    """Store the file on the remote; return its path there."""
+    size = os.path.getsize(local_path)
+    with open(local_path, "rb") as stdin:
+        out, _ = await run_ssh(target, build_remote_command(filename, size), stdin,
+                               UPLOAD_TIMEOUT, "Upload")
+    out = out.decode("utf-8", "replace")
     remote_path = parse_remote_path(out, filename)
     if remote_path is None:
         log.error("no path in upload output: %r", out)
@@ -667,6 +868,91 @@ async def capture_and_upload(session):
         await session.async_send_text(text, suppress_broadcast=True)
 
 
+# --- Open Remote Image ---------------------------------------------------------
+
+async def image_path_in_session(session):
+    """The image path to open: the selected one, or the last one on screen."""
+    selection = await session.async_get_selection()
+    text = ""
+    if selection.sub_selections:
+        text = await session.async_get_selection_text(selection)
+    contents = await session.async_get_screen_contents()
+    lines = join_soft_wraps((contents.line(i).string, contents.line(i).hard_eol)
+                            for i in range(contents.number_of_lines))
+    path = choose_image_path(text, lines)
+    log.info("selection %r -> image path %r", text, path)
+    return path
+
+
+async def download(target, remote_path):
+    """Fetch the image at `remote_path`; return the local copy's path."""
+    max_bytes = MAX_DOWNLOAD_MB * 1024 * 1024
+    out, _ = await run_ssh(target, build_download_command(remote_path, max_bytes),
+                           asyncio.subprocess.DEVNULL, DOWNLOAD_TIMEOUT, "Download")
+    data = parse_download_output(out)
+    if data is None:
+        log.error("unexpected download output (%d bytes): %r", len(out), out[:200])
+        raise ShotDropError("Download failed", "The remote's output wasn't the file it announced.")
+    extension = image_type(data)
+    if extension is None:
+        # Only open real images: the path came from text on screen, which
+        # anything printing to this terminal can control.
+        raise ShotDropError("Not an image",
+                            f"{remote_path} isn't a PNG, JPEG, GIF, WebP, HEIC, TIFF or BMP file.")
+
+    directory = os.path.expanduser(DOWNLOAD_DIR)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    remove_old_downloads(directory)
+    local_path = os.path.join(directory, local_image_name(target.destination, remote_path,
+                                                          extension))
+    fd, part = tempfile.mkstemp(dir=directory, prefix=".download-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(part, local_path)
+    except BaseException:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        raise
+    return local_path
+
+
+def remove_old_downloads(directory):
+    """Delete images ShotDrop downloaded more than RETENTION_DAYS ago.
+
+    Only files named the way ShotDrop names them, in case DOWNLOAD_DIR is set
+    to a folder with other files in it.
+    """
+    cutoff = datetime.datetime.now().timestamp() - RETENTION_DAYS * 86400
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return
+    for entry in entries:
+        if not DOWNLOAD_NAME_RE.search(entry.name):
+            continue
+        try:
+            if entry.is_file(follow_symlinks=False) and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+        except OSError:
+            pass
+
+
+async def open_remote_image(session):
+    """The whole "Open Remote Image" flow. Raises ShotDropError for errors to show."""
+    remote_path = await image_path_in_session(session)
+    if not is_safe_remote_image_path(remote_path):
+        raise ShotDropError("Won't open this path", remote_path)
+    target = await find_target(session)
+    local_path = await download(target, remote_path)
+    log.info("downloaded %s:%s to %s", target.destination, remote_path, local_path)
+    code, _, err = await run(["/usr/bin/open", local_path], timeout=10)
+    if code != 0:
+        raise ShotDropError("Couldn't open the image", _short(err) or local_path)
+
+
 # --- iTerm2 glue -------------------------------------------------------------
 
 def setup_logging():
@@ -700,18 +986,30 @@ def main():
         except Exception:
             log.exception("couldn't show alert")
 
-    async def run_flow(connection, session):
-        nonlocal busy
+    async def report_errors(connection, flow):
         try:
-            await capture_and_upload(session)
+            await flow
         except ShotDropError as e:
             log.error("%s", e)
             await alert(connection, e.title, e.message)
         except Exception as e:
             log.exception("unexpected error")
             await alert(connection, "ShotDrop failed", f"{e} (see {LOG_PATH})")
+
+    async def run_capture(connection, session):
+        nonlocal busy
+        try:
+            await report_errors(connection, capture_and_upload(session))
         finally:
             busy = False
+
+    def spawn(flow):
+        # RPCs return right away: the capture waits on the user for as long
+        # as they like, and a download can be slow, either of which would
+        # exceed iTerm2's RPC timeout.
+        task = asyncio.create_task(flow)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def start(connection):
         app = await iterm2.async_get_app(connection)
@@ -727,14 +1025,26 @@ def main():
                 log.error("no session with id %r", session_id)
                 return
             busy = True
-            # Return right away: the capture waits on the user for as long as
-            # they like, which would exceed iTerm2's RPC timeout.
-            task = asyncio.create_task(run_flow(connection, session))
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+            spawn(run_capture(connection, session))
 
         await shotdrop.async_register(connection)
         log.info("registered shotdrop(session_id: id)")
+
+        @iterm2.ContextMenuProviderRPC
+        async def shotdrop_open(session_id=iterm2.Reference("id")):
+            session = app.get_session_by_id(session_id)
+            if session is None:
+                log.error("no session with id %r", session_id)
+                return
+            spawn(report_errors(connection, open_remote_image(session)))
+
+        try:
+            await shotdrop_open.async_register(connection, "Open Remote Image",
+                                               "shotdrop.open-remote-image")
+            log.info("registered context menu item")
+        except Exception:
+            # E.g. iTerm2 too old for context menu items: keep the hotkey working.
+            log.exception("couldn't register the context menu item")
 
     iterm2.run_forever(start)
 

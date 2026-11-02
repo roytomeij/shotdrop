@@ -18,6 +18,10 @@ remote host, select a screen area, and the screenshot is uploaded to that host.
 The remote path is then pasted into the terminal and copied to your local
 clipboard.
 
+It also works the other way: right-click an image path shown in the terminal,
+such as a screenshot Claude Code took on the remote, and choose **Open Remote
+Image** to view it on your Mac (see [Opening remote images](#opening-remote-images)).
+
 **Where it runs:**
 - **Locally:** macOS with iTerm2 only.
 - **Remote:** any Unix-like host reached with OpenSSH, such as macOS or Linux
@@ -90,7 +94,12 @@ turns a pasted image path into an `[Image #1]` attachment.
    This copies `shotdrop.py` to
    `~/Library/Application Support/iTerm2/Scripts/AutoLaunch/`. Quit and
    reopen iTerm2 to load it. To update, `git pull` (or edit `shotdrop.py`),
-   then run `./install.sh` and restart iTerm2 again.
+   then run `./install.sh` and reload the script.
+
+   To reload without quitting iTerm2 (and closing your tabs), open Scripts →
+   Manage → Console, select `shotdrop.py` and click **Restart**. Closing a tab
+   isn't enough: the script runs on its own, apart from any tab. Don't start
+   a second copy from the Scripts menu while the old one is still running.
 
 4. **Bind a key:** Settings → Keys → Key Bindings → **+** → pick a shortcut →
    Action "Invoke Script Function" → enter:
@@ -117,6 +126,35 @@ turns a pasted image path into an `[Image #1]` attachment.
 In a tab running Claude Code on the remote, press the hotkey, select an area,
 then type your question after the inserted path and press Enter.
 
+### Opening remote images
+
+The other way around: when Claude Code on the remote prints the path of an
+image it made (say, `Screenshot: /private/tmp/…/counter-6.jpg`), right-click
+the path and choose **Open Remote Image**. ShotDrop downloads the image over
+the tab's ssh connection and opens it in your default viewer (Preview). There's
+nothing to set up: the menu item appears when the script starts.
+
+Which path it opens:
+- **Selected text with an image path in it:** that path (the last one, if
+  there are several).
+- **Selected text that's only part of a path:** the visible path it belongs
+  to. Right-clicking selects the text under the pointer, which can stop
+  partway through a long path.
+- **No selection:** the last image path visible in the tab.
+
+Paths must be absolute and end in `.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`,
+`.heic`, `.tif`/`.tiff` or `.bmp`. Paths that tmux or Claude Code break across
+lines are joined up again. Only real images are opened: ShotDrop checks the
+downloaded file's contents, because the path comes from text on screen, which
+anything printing to the terminal can control.
+
+Downloads go to `~/Library/Caches/shotdrop` and are deleted after
+`RETENTION_DAYS`.
+
+If the program in the tab captures the mouse (tmux with `mouse on`, say),
+right-clicks go to that program instead. Hold ⌥ Option while right-clicking to
+get iTerm2's menu.
+
 ## Configuration
 
 At the top of `shotdrop.py`:
@@ -127,6 +165,9 @@ At the top of `shotdrop.py`:
 | `RETENTION_DAYS` | `7`               | Older `.png` files in that directory are deleted on each upload. |
 | `INSERT_MODE`    | `"bracketed"`     | `"bracketed"`: paste the path (gives `[Image #N]` in Claude Code). `"typed"`: type the plain path (Claude still reads the file, without the attachment pill). `"none"`: clipboard only. |
 | `UPLOAD_TIMEOUT` | `30`              | Seconds before the upload is aborted. |
+| `DOWNLOAD_DIR`   | `"~/Library/Caches/shotdrop"` | Local folder for images opened with **Open Remote Image**. Files ShotDrop put there are deleted after `RETENTION_DAYS`. |
+| `DOWNLOAD_TIMEOUT` | `30`            | Seconds before a download is aborted. |
+| `MAX_DOWNLOAD_MB` | `50`             | Larger remote files aren't downloaded. |
 
 ## Troubleshooting
 
@@ -170,6 +211,18 @@ Script output and Python errors also show in Scripts → Manage → Console.
 - **The screenshot only shows the desktop wallpaper.** iTerm2 lacks Screen
   Recording permission (see Setup step 5), or it was granted without
   restarting iTerm2.
+- **No "Open Remote Image" in the right-click menu.** Check that the script
+  is running (see above), and hold ⌥ Option while right-clicking if the
+  program in the tab captures the mouse.
+- **"No image path in the selection".** Some other text was selected. Click
+  once to clear the selection, then right-click the path.
+- **"Download failed: … no such file".** The file isn't on the host the tab
+  is connected to. With local tmux, ShotDrop downloads through the *active*
+  pane's ssh, so click into the pane showing the path first.
+- **A long path in a side-by-side tmux split isn't found.** Neither iTerm2 nor
+  ShotDrop can tell where one tmux pane ends and the next begins, so a path
+  broken across lines there can't be joined up. Select the whole path, or
+  zoom the pane (`prefix z`) first.
 - **The path appears but no `[Image #1]`.** Claude Code only attaches images
   that arrive as a paste. If the paste markers get lost on the way (e.g.
   through tmux), set `INSERT_MODE = "typed"`. Claude Code still reads the
@@ -184,11 +237,13 @@ Script output and Python errors also show in Scripts → Manage → Console.
 Then quit iTerm2 (or stop the script under Scripts → Manage), and remove the
 key binding. Screenshots left on remotes are in `/tmp/shotdrop-<uid>` (older
 versions used `/tmp/shotdrop`). Most systems
-also clear old files from `/tmp` on their own.
+also clear old files from `/tmp` on their own. Downloaded images are in
+`~/Library/Caches/shotdrop`.
 
 ## Development
 
-The ssh argument parser has unit tests that run with any Python 3:
+Everything except the iTerm2 glue has unit tests that run with any Python 3
+(the remote commands run locally against temporary directories):
 
 ```sh
 python3 -m unittest -v
